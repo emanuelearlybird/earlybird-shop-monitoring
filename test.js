@@ -2,271 +2,240 @@
 //
 // Approach
 // --------
-// The shop is fronted by a Cloudflare-style WAF that aggressively
-// rate-limits POST traffic to /cart/add.js coming from a single IP
-// (≈10 successful adds, then long 429/"Verifying your connection..." block).
-// GitHub-Actions runner IPs hit that limit very quickly.
+// The shop is fronted by a Cloudflare-style WAF that aggressively rate-limits
+// non-browser traffic. To verify availability we drive a real Chromium via
+// Playwright, warm up cookies, and then hit the shop's own JSON endpoints from
+// inside the page context.
 //
-// To stay useful on a daily schedule we therefore:
+// Behaviour
+// ---------
+// Hard fail (counted, exit 1):
+//   - variant.available === false from products.json
+//   - cart/add.js returns a JSON error (description / message field)
+// Soft skip (logged, NOT counted):
+//   - WAF interstitial / HTTP 429 even after retries
+// Bail out:
+//   - too many consecutive WAF blocks in a row -> stop, exit 1
 //
-//   1) ALWAYS check every variant via products.json (free, reliable):
-//        - variant.available === false  -> hard failure
-//
-//   2) ADDITIONALLY run a real /cart/add.js smoke test for as many
-//      variants as the WAF allows, batched and re-warmed via real
-//      page navigations:
-//        - HTTP 422/4xx with a real JSON error  -> hard failure
-//        - HTTP 429 / HTML interstitial after recovery -> SKIP (warn,
-//          but don’t fail the build, because the IP is being throttled,
-//          not because the variant is broken).
-//
-// This delivers:
-//   - Reliable daily signal for "is anything sold-out / unbuyable?"
-//     (covered by products.json)
-//   - Real functional verification of /cart/add.js for the variants we
-//     can reach without false-positive WAF noise.
-//
-// Endpoints used:
-//   GET  /collections/<handle>/products.json?limit=250
-//   POST /cart/add.js   { id: VARIANT_ID, quantity: 1 }
-//
-// Exit code: 1 on any HARD failure, otherwise 0.
+// At the end, an array of structured failures is written to failures.json
+// for the workflow to use in the issue body / Teams notification.
 
 const { chromium } = require('playwright');
+const fs = require('fs');
 
-const SHOP_URL = 'https://earlybird-coffee.de';
-const COLLECTION = 'kaffee';
-const USER_AGENT =
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
-            'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-            'Chrome/124.0.0.0 Safari/537.36';
+const SHOP = 'https://earlybird-coffee.de';
+const COLLECTION = '/collections/kaffee';
+const PRODUCTS_JSON = SHOP + COLLECTION + '/products.json?limit=250';
 
-// Pacing for the cart/add smoke test
 const BATCH_SIZE = 4;
-const BATCH_INNER_DELAY_MS = 1500;
-const BATCH_COOLDOWN_MS = 12000;
-const RECOVERY_WAIT_MS = 25000;
+const COOLDOWN_MS = 12000;
 const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 6000;
+const MAX_CONSECUTIVE_BLOCKS = 3;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function looksBlocked(text) {
+  if (typeof text !== 'string') return false;
+  const t = text.toLowerCase();
+  return t.includes('verifying your connection') ||
+         t.includes('just a moment') ||
+         t.includes('cf-mitigated') ||
+         t.includes('attention required') ||
+         t.includes('<!doctype html');
+}
 
 async function waitForRealContent(page) {
-            const deadline = Date.now() + 45000;
-            while (Date.now() < deadline) {
-                          const title = await page.title().catch(() => '');
-                          if (title && !/verify|verifying|just a moment/i.test(title)) return;
-                          await page.waitForTimeout(1000);
-            }
+  // navigate to homepage first to pick up cookies / clearance
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await page.goto(SHOP + '/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+      const html = await page.content();
+      if (!looksBlocked(html)) return;
+    } catch (e) {}
+    await page.waitForTimeout(4000);
+  }
 }
 
 async function warmUp(page) {
-            await page.goto(`${SHOP_URL}/collections/${COLLECTION}`, {
-                          waitUntil: 'domcontentloaded',
-                          timeout: 60000
-            });
-            await waitForRealContent(page);
+  await waitForRealContent(page);
+  // Touch the collection too so cookies match
+  try {
+    await page.goto(SHOP + COLLECTION, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  } catch (e) {}
 }
 
 async function pageFetch(page, url, init) {
-            return page.evaluate(
-                          async ({ u, opts }) => {
-                                          try {
-                                                            const r = await fetch(u, {
-                                                                                credentials: 'include',
-                                                                                ...opts,
-                                                                                headers: { Accept: 'application/json', ...(opts && opts.headers) }
-                                                            });
-                                                            const text = await r.text();
-                                                            let body = null;
-                                                            try { body = JSON.parse(text); } catch (_) {}
-                                                            return { status: r.status, ok: r.ok, body, text: text.slice(0, 200) };
-                                          } catch (e) {
-                                                            return { status: 0, ok: false, body: null, text: String(e).slice(0, 200) };
-                                          }
-                          },
-                      { u: url, opts: init || {} }
-                        );
-}
-
-function looksBlocked(res) {
-            if (!res) return true;
-            if (res.status === 429 || res.status === 403 || res.status === 503) return true;
-            if (!res.body && /verifying your connection|just a moment|<!DOCTYPE/i.test(res.text)) return true;
-            return false;
+  return await page.evaluate(async ({ url, init }) => {
+    const res = await fetch(url, Object.assign({ credentials: 'include' }, init || {}));
+    const text = await res.text();
+    return { status: res.status, ok: res.ok, text };
+  }, { url, init });
 }
 
 async function fetchProducts(page) {
-            const url = `${SHOP_URL}/collections/${COLLECTION}/products.json?limit=250`;
-            let res;
-            for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-                          res = await pageFetch(page, url);
-                          if (!looksBlocked(res) && res.ok && res.body) return res.body.products || [];
-                          console.log(
-                                          `  products.json blocked (status ${res.status}), recovery ${attempt + 1}/${MAX_RETRIES + 1}`
-                                        );
-                          await sleep(RECOVERY_WAIT_MS);
-                          try { await warmUp(page); } catch (_) {}
-            }
-            throw new Error(
-                          `products.json failed after retries (status ${res && res.status}): ${res && res.text}`
-                        );
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const r = await pageFetch(page, PRODUCTS_JSON);
+    if (r.ok && !looksBlocked(r.text)) {
+      try {
+        return JSON.parse(r.text).products || [];
+      } catch (e) {}
+    }
+    await warmUp(page);
+    await page.waitForTimeout(3000);
+  }
+  throw new Error('Could not load products.json after multiple attempts');
 }
 
 async function addVariantOnce(page, variantId) {
-            return pageFetch(page, `${SHOP_URL}/cart/add.js`, {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ id: variantId, quantity: 1 })
-            });
+  // clear cart
+  await pageFetch(page, SHOP + '/cart/clear.js', { method: 'POST' });
+  // add variant
+  const res = await pageFetch(page, SHOP + '/cart/add.js', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({ id: variantId, quantity: 1 })
+  });
+  return res;
 }
 
-// Returns { kind: 'ok' | 'fail' | 'blocked', res }
-async function checkVariant(page, variantId, label) {
-            for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
-                          const res = await addVariantOnce(page, variantId);
-                          const ok =
-                                          res.ok &&
-                                          res.body &&
-                                          (res.body.id || Array.isArray(res.body.items));
-                          if (ok) return { kind: 'ok', res };
-                          if (!looksBlocked(res)) return { kind: 'fail', res };
-                          if (attempt > MAX_RETRIES) return { kind: 'blocked', res };
-                          console.log(
-                                          `  blocked on ${label} (status ${res.status}), recovery ${attempt}/${MAX_RETRIES}: ` +
-                                          `waiting ${RECOVERY_WAIT_MS}ms then re-warming...`
-                                        );
-                          await sleep(RECOVERY_WAIT_MS);
-                          try { await warmUp(page); } catch (_) {}
-            }
+// Returns: { kind: 'ok' | 'fail' | 'block', reason?: string }
+async function checkVariant(page, variant, productTitle) {
+  if (variant.available === false) {
+    return { kind: 'fail', reason: 'available === false in products.json' };
+  }
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    let res;
+    try {
+      res = await addVariantOnce(page, variant.id);
+    } catch (e) {
+      if (attempt < MAX_RETRIES) { await page.waitForTimeout(RETRY_DELAY_MS); continue; }
+      return { kind: 'block', reason: 'request error: ' + e.message };
+    }
+    if (res.status === 429 || looksBlocked(res.text)) {
+      if (attempt < MAX_RETRIES) {
+        await page.waitForTimeout(RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+      return { kind: 'block', reason: 'WAF/429 after retries' };
+    }
+    // try to parse JSON
+    let parsed = null;
+    try { parsed = JSON.parse(res.text); } catch (e) {}
+    if (!parsed) {
+      if (attempt < MAX_RETRIES) { await page.waitForTimeout(RETRY_DELAY_MS); continue; }
+      return { kind: 'block', reason: 'non-JSON response (likely WAF)' };
+    }
+    if (parsed.status && parsed.status >= 400 && (parsed.description || parsed.message)) {
+      return { kind: 'fail', reason: 'cart/add.js error: ' + (parsed.description || parsed.message) };
+    }
+    if (!res.ok) {
+      return { kind: 'fail', reason: 'cart/add.js HTTP ' + res.status + ' ' + (parsed.description || parsed.message || '') };
+    }
+    return { kind: 'ok' };
+  }
+  return { kind: 'block', reason: 'unknown' };
 }
 
 (async () => {
-            const browser = await chromium.launch({
-                          args: ['--no-sandbox', '--disable-blink-features=AutomationControlled']
-            });
-            const context = await browser.newContext({
-                          userAgent: USER_AGENT,
-                          locale: 'de-DE',
-                          extraHTTPHeaders: { 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8' }
-            });
-            const page = await context.newPage();
+  const browser = await chromium.launch({ args: ['--no-sandbox'] });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    locale: 'de-DE'
+  });
+  const page = await context.newPage();
 
-   const hardFailures = [];   // -> exit 1
-   const skipped = [];        // -> warn only
-   let okCount = 0;
+  let exitCode = 0;
+  const failures = [];   // structured fails for downstream notification
+  const skipped  = [];   // soft skips (informational)
+  let consecutiveBlocks = 0;
 
-   try {
-                 console.log(`Warming up: ${SHOP_URL}/collections/${COLLECTION}`);
-                 await warmUp(page);
+  try {
+    await warmUp(page);
+    const products = await fetchProducts(page);
 
-              console.log('Loading products.json ...');
-                 const products = await fetchProducts(page);
-                 console.log(`Found ${products.length} products`);
-                 if (products.length === 0) {
-                                 throw new Error('products.json returned 0 products');
-                 }
+    // Flatten all variants
+    const all = [];
+    for (const p of products) {
+      for (const v of (p.variants || [])) {
+        all.push({ product: p, variant: v });
+      }
+    }
+    console.log('Found ' + products.length + ' products / ' + all.length + ' variants.');
 
-              // 1) availability check on every variant
-              const all = [];
-                 for (const product of products) {
-                                 for (const variant of product.variants || []) {
-                                                   const label = `${product.title} / ${variant.title} (id ${variant.id})`;
-                                                   if (variant.available === false) {
-                                                                       const msg = `${label}: variant.available === false`;
-                                                                       console.log(`FAIL: ${msg}`);
-                                                                       hardFailures.push(msg);
-                                                   } else {
-                                                                       all.push({ product, variant, label });
-                                                   }
-                                 }
-                 }
-                 console.log(
-                                 `\nAvailability check: ${all.length} available, ` +
-                                 `${hardFailures.length} unavailable.`
-                               );
+    let processed = 0;
+    for (let i = 0; i < all.length; i += BATCH_SIZE) {
+      const batch = all.slice(i, i + BATCH_SIZE);
+      for (const { product, variant } of batch) {
+        processed++;
+        const label = product.title + ' / ' + variant.title + ' (id ' + variant.id + ')';
+        const r = await checkVariant(page, variant, product.title);
+        if (r.kind === 'ok') {
+          consecutiveBlocks = 0;
+          console.log('OK   [' + processed + '/' + all.length + '] ' + label);
+        } else if (r.kind === 'fail') {
+          consecutiveBlocks = 0;
+          exitCode = 1;
+          failures.push({
+            productTitle: product.title,
+            productHandle: product.handle,
+            variantId: variant.id,
+            variantTitle: variant.title,
+            reason: r.reason
+          });
+          console.log('FAIL [' + processed + '/' + all.length + '] ' + label + ' :: ' + r.reason);
+        } else {
+          // block / soft skip
+          consecutiveBlocks++;
+          skipped.push({ productTitle: product.title, variantId: variant.id, variantTitle: variant.title, reason: r.reason });
+          console.log('SKIP [' + processed + '/' + all.length + '] ' + label + ' :: ' + r.reason);
+          if (consecutiveBlocks >= MAX_CONSECUTIVE_BLOCKS) {
+            console.log('Too many consecutive WAF blocks, bailing out.');
+            exitCode = 1;
+            break;
+          }
+        }
+      }
+      if (consecutiveBlocks >= MAX_CONSECUTIVE_BLOCKS) break;
+      // cooldown between batches and re-warm
+      if (i + BATCH_SIZE < all.length) {
+        await page.waitForTimeout(COOLDOWN_MS);
+        await warmUp(page);
+      }
+    }
+  } catch (e) {
+    console.error('Fatal error:', e && e.stack || e);
+    exitCode = 1;
+    failures.push({
+      productTitle: '(monitoring system)',
+      variantId: 0,
+      variantTitle: 'Fatal error',
+      reason: (e && e.message) ? e.message : String(e)
+    });
+  } finally {
+    await browser.close();
+  }
 
-              // 2) functional cart/add smoke test (batched)
-              console.log(`\nFunctional cart/add.js test:`);
-                 let inBatch = 0;
-                 let givenUp = false;
+  // Persist structured result for downstream steps
+  try {
+    fs.writeFileSync('failures.json', JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      exitCode,
+      failures,
+      skippedCount: skipped.length
+    }, null, 2));
+  } catch (e) {
+    console.error('Could not write failures.json:', e.message);
+  }
 
-              for (const { variant, label } of all) {
-                              if (givenUp) {
-                                                skipped.push(`${label}: skipped (WAF cooldown)`);
-                                                continue;
-                              }
+  // Human-readable summary block (also picked up by the workflow if needed)
+  console.log('');
+  console.log('===== SUMMARY =====');
+  console.log('Failures: ' + failures.length);
+  for (const f of failures) {
+    console.log(' - ' + f.productTitle + ' / ' + f.variantTitle + ' (id ' + f.variantId + ') :: ' + f.reason);
+  }
+  console.log('Soft-skipped (WAF): ' + skipped.length);
+  console.log('Exit code: ' + exitCode);
+  console.log('===================');
 
-                   if (inBatch >= BATCH_SIZE) {
-                                     console.log(`-- batch cooldown (${BATCH_COOLDOWN_MS}ms) + re-warm --`);
-                                     await sleep(BATCH_COOLDOWN_MS);
-                                     try { await warmUp(page); } catch (_) {}
-                                     inBatch = 0;
-                   }
-
-                   let result;
-                              try {
-                                                result = await checkVariant(page, variant.id, label);
-                              } catch (err) {
-                                                const msg = `${label}: exception ${err && err.message}`;
-                                                console.log(`FAIL: ${msg}`);
-                                                hardFailures.push(msg);
-                                                inBatch++;
-                                                await sleep(BATCH_INNER_DELAY_MS);
-                                                continue;
-                              }
-
-                   if (result.kind === 'ok') {
-                                     okCount++;
-                                     console.log(`OK:    ${label}`);
-                   } else if (result.kind === 'fail') {
-                                     const detail = result.res.body
-                                       ? JSON.stringify(result.res.body).slice(0, 200)
-                                                         : result.res.text;
-                                     const msg = `${label}: add.js status ${result.res.status} ${detail}`;
-                                     console.log(`FAIL:  ${msg}`);
-                                     hardFailures.push(msg);
-                   } else {
-                                     // blocked – treat as skipped, do not fail the build
-                                const msg = `${label}: WAF blocked (status ${result.res.status})`;
-                                     console.log(`SKIP:  ${msg}`);
-                                     skipped.push(msg);
-                                     // After repeated WAF blocks the IP is in a long penalty box;
-                                // stop spending time/CI minutes hammering the endpoint.
-                                if (skipped.length >= 3) {
-                                                    console.log(
-                                                                          `Too many consecutive WAF blocks (${skipped.length}). ` +
-                                                                          `Skipping remaining cart/add.js checks.`
-                                                                        );
-                                                    givenUp = true;
-                                }
-                   }
-
-                   inBatch++;
-                              await sleep(BATCH_INNER_DELAY_MS);
-              }
-
-              console.log(
-                              `\nCart/add summary: ok=${okCount}, fail=${hardFailures.length}, ` +
-                              `skipped=${skipped.length}/${all.length} variants.`
-                            );
-   } catch (err) {
-                 console.error(`Fatal error: ${err && (err.stack || err.message) || err}`);
-                 hardFailures.push(`fatal: ${err && err.message || err}`);
-   } finally {
-                 await browser.close().catch(() => {});
-   }
-
-   if (skipped.length > 0) {
-                 console.log(`\n${skipped.length} skipped (WAF):`);
-                 for (const s of skipped) console.log(`- ${s}`);
-   }
-
-   if (hardFailures.length > 0) {
-                 console.log(`\n${hardFailures.length} HARD failure(s):`);
-                 for (const f of hardFailures) console.log(`- ${f}`);
-                 process.exit(1);
-   }
-
-   console.log('\nAll checked variants are orderable. No hard failures.');
-            process.exit(0);
+  process.exit(exitCode);
 })();
