@@ -48,11 +48,12 @@ jobs:
             const failures = data.failures || [];
 
             const ids = failures.map(f => String(f.variantId)).sort();
-            const fingerprint = ids.length ? ids.join(',') : 'no-failures-but-exit-1';
+            const fingerprint = ids.length ? ids.join(',') : 'infra-error';
             const marker = '<!-- shop-monitoring-fingerprint: ' + fingerprint + ' -->';
 
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
+            // Pull all open shop-monitoring issues
             const existing = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -60,23 +61,60 @@ jobs:
               labels: 'shop-monitoring',
               per_page: 100
             });
-            const dup = existing.find(i => (i.body || '').includes(marker));
 
-            core.setOutput('changed', dup ? 'false' : 'true');
-            core.setOutput('fingerprint', fingerprint);
-            core.setOutput('failure_count', String(failures.length));
+            // Helper: parse the marker out of an existing issue body
+            function fpOf(issue) {
+              const m = (issue.body || '').match(/<!-- shop-monitoring-fingerprint: ([^>]*) -->/);
+              return m ? m[1].trim() : null;
+            }
 
-            if (dup) {
-              core.info('Existing open issue #' + dup.number + ' has same fingerprint; not creating a new one.');
+            // Case 1: there is already an open issue with the EXACT same fingerprint
+            const exact = existing.find(i => fpOf(i) === fingerprint);
+            if (exact) {
+              core.info('Existing open issue #' + exact.number + ' has same fingerprint; not creating a new one.');
+              core.setOutput('changed', 'false');
+              core.setOutput('fingerprint', fingerprint);
+              core.setOutput('failure_count', String(failures.length));
               return;
             }
+
+            // Case 2: this run has 0 structured failures (likely WAF / infra blip).
+            // If ANY shop-monitoring issue is already open, do not spam a new one.
+            if (failures.length === 0 && existing.length > 0) {
+              core.info('Infra-only failure (no structured variants) and an open issue exists; skipping new issue.');
+              core.setOutput('changed', 'false');
+              core.setOutput('fingerprint', fingerprint);
+              core.setOutput('failure_count', '0');
+              return;
+            }
+
+            // Case 3: an open issue covers a SUPERSET of today's failing ids
+            // (i.e. today's failures are already known to be broken). Skip.
+            const supersetIssue = existing.find(i => {
+              const f = fpOf(i);
+              if (!f || f === 'infra-error') return false;
+              const set = new Set(f.split(','));
+              return ids.length > 0 && ids.every(id => set.has(id));
+            });
+            if (supersetIssue) {
+              core.info('Open issue #' + supersetIssue.number + ' already covers today\'s failing variant ids; skipping.');
+              core.setOutput('changed', 'false');
+              core.setOutput('fingerprint', fingerprint);
+              core.setOutput('failure_count', String(failures.length));
+              return;
+            }
+
+            // Otherwise: real change -> open a fresh issue.
+            core.setOutput('changed', 'true');
+            core.setOutput('fingerprint', fingerprint);
+            core.setOutput('failure_count', String(failures.length));
 
             const lines = [];
             lines.push('Der tägliche Shop-Monitoring-Lauf ist fehlgeschlagen.');
             lines.push('');
             lines.push('**Betroffene Varianten (' + failures.length + '):**');
             if (failures.length === 0) {
-              lines.push('_(keine strukturierten Fehler – siehe Logs)_');
+              lines.push('_(keine strukturierten Fehler – wahrscheinlich Infrastruktur-/WAF-Problem; siehe Logs)_');
             } else {
               for (const f of failures) {
                 const url = 'https://earlybird-coffee.de/products/' + (f.productHandle || '');
