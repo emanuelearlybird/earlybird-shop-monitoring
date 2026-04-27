@@ -24,31 +24,98 @@ jobs:
       - run: npx playwright install --with-deps chromium
 
       - id: shoptest
+        name: Run shop monitoring
         run: npm test
+        continue-on-error: true
 
-      - name: Notify on failure (create GitHub issue)
-        if: failure()
+      - name: Upload failures.json artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failures
+          path: failures.json
+          if-no-files-found: ignore
+
+      - name: Notify on failure (deduplicated GitHub issue)
+        if: steps.shoptest.outcome == 'failure'
+        id: notify_issue
         uses: actions/github-script@v7
         with:
           script: |
-            const title = `Shop Monitoring fehlgeschlagen – ${new Date().toISOString().slice(0,10)}`;
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const body = [
-              `Der tägliche Shop-Monitoring-Lauf ist fehlgeschlagen.`,
-              ``,
-              `Mögliche Ursache: mindestens eine Variante ist nicht bestellbar (\`available === false\` oder \`cart/add.js\`-Fehler).`,
-              ``,
-              `**Run ansehen (mit Logs):** ${runUrl}`,
-              ``,
-              `In den Logs unter dem Step "npm test" stehen alle betroffenen Varianten als \`FAIL ...\` Zeilen.`,
-              ``,
-              `_Dieses Issue wurde automatisch vom Workflow erstellt._`
-            ].join('\n');
+            const fs = require('fs');
+            let data = { failures: [] };
+            try { data = JSON.parse(fs.readFileSync('failures.json', 'utf8')); } catch (e) {}
+            const failures = data.failures || [];
 
+            const ids = failures.map(f => String(f.variantId)).sort();
+            const fingerprint = ids.length ? ids.join(',') : 'no-failures-but-exit-1';
+            const marker = '<!-- shop-monitoring-fingerprint: ' + fingerprint + ' -->';
+
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'shop-monitoring',
+              per_page: 100
+            });
+            const dup = existing.find(i => (i.body || '').includes(marker));
+
+            core.setOutput('changed', dup ? 'false' : 'true');
+            core.setOutput('fingerprint', fingerprint);
+            core.setOutput('failure_count', String(failures.length));
+
+            if (dup) {
+              core.info('Existing open issue #' + dup.number + ' has same fingerprint; not creating a new one.');
+              return;
+            }
+
+            const lines = [];
+            lines.push('Der tägliche Shop-Monitoring-Lauf ist fehlgeschlagen.');
+            lines.push('');
+            lines.push('**Betroffene Varianten (' + failures.length + '):**');
+            if (failures.length === 0) {
+              lines.push('_(keine strukturierten Fehler – siehe Logs)_');
+            } else {
+              for (const f of failures) {
+                const url = 'https://earlybird-coffee.de/products/' + (f.productHandle || '');
+                lines.push('- **' + f.productTitle + '** – Variante: _' + f.variantTitle + '_  ');
+                lines.push('  Variant-ID: \`' + f.variantId + '\`  ');
+                lines.push('  Grund: ' + f.reason + '  ');
+                if (f.productHandle) lines.push('  Produkt: ' + url);
+              }
+            }
+            lines.push('');
+            lines.push('**Run / Logs:** ' + runUrl);
+            lines.push('');
+            lines.push('_Dieses Issue wurde automatisch erstellt. Solange dieselben Varianten betroffen sind, wird kein neues Issue mehr angelegt. Schließe das Issue, sobald das Problem gelöst ist – beim nächsten echten Fehler bekommst du dann wieder eine Mail._');
+            lines.push('');
+            lines.push(marker);
+
+            const today = new Date().toISOString().slice(0,10);
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title,
-              body,
+              title: `Shop Monitoring fehlgeschlagen – ${failures.length} Variante(n) – ${today}`,
+              body: lines.join('\n'),
               labels: ['shop-monitoring', 'automated']
             });
+
+      - name: Notify Microsoft Teams (only if webhook configured and failure changed)
+        if: steps.shoptest.outcome == 'failure' && steps.notify_issue.outputs.changed == 'true'
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "TEAMS_WEBHOOK_URL secret not set – skipping Teams notification."
+            exit 0
+          fi
+          node .github/scripts/notify-teams.js
+
+      - name: Re-fail job if shop test failed
+        if: steps.shoptest.outcome == 'failure'
+        run: exit 1
