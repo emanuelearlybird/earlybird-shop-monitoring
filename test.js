@@ -1,72 +1,87 @@
-const { chromium } = require('playwright');
+const SHOP_URL = 'https://earlybird-coffee.de';
+const COLLECTION = 'kaffee';
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Fetch failed: ${response.status} ${url}`);
+  }
+
+  return response.json();
+}
+
+async function testVariant(product, variant) {
+  const cartClearUrl = `${SHOP_URL}/cart/clear.js`;
+  const cartAddUrl = `${SHOP_URL}/cart/add.js`;
+
+  await fetch(cartClearUrl, { method: 'POST' });
+
+  const response = await fetch(cartAddUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      id: variant.id,
+      quantity: 1
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    return {
+      ok: false,
+      message: text.slice(0, 300)
+    };
+  }
+
+  return {
+    ok: true,
+    message: 'OK'
+  };
+}
 
 (async () => {
-  const browser = await chromium.launch();
-  const page = await browser.newPage();
+  const url = `${SHOP_URL}/collections/${COLLECTION}/products.json?limit=250`;
+  console.log(`Loading products from: ${url}`);
 
-  const baseUrl = 'https://earlybird-coffee.de/collections/kaffee';
+  const data = await fetchJson(url);
+  const products = data.products || [];
 
-  console.log('Opening collection page...');
-  await page.goto(baseUrl);
+  console.log(`Found ${products.length} products`);
 
-  const productLinks = await page.$$eval('a[href*="/products/"]', links =>
-    [...new Set(links.map(l => l.href))]
-  );
+  const failures = [];
 
-  console.log(`Found ${productLinks.length} products`);
+  for (const product of products) {
+    for (const variant of product.variants) {
+      const label = `${product.title} / ${variant.title}`;
 
-  for (const link of productLinks) {
-    console.log(`\nChecking product: ${link}`);
-
-    await page.goto(link);
-
-    // Varianten auswählen (falls vorhanden)
-    const selects = await page.$$('select');
-
-    if (selects.length > 0) {
-      for (const select of selects) {
-        const options = await select.$$('option');
-
-        for (let i = 0; i < options.length; i++) {
-          await select.selectOption({ index: i });
-
-          const button = await page.$('button[type="submit"]');
-
-          if (!button) {
-            console.log('No add-to-cart button found');
-            continue;
-          }
-
-          const disabled = await button.isDisabled();
-
-          if (disabled) {
-            console.log(`Variant ${i}: NOT available`);
-          } else {
-            await button.click();
-            console.log(`Variant ${i}: OK`);
-
-            // Warenkorb wieder leeren (einfach reload)
-            await page.reload();
-          }
-        }
+      if (!variant.available) {
+        failures.push(`${label} is marked unavailable`);
+        console.log(`FAIL: ${label} is marked unavailable`);
+        continue;
       }
-    } else {
-      const button = await page.$('button[type="submit"]');
 
-      if (!button) {
-        console.log('No add-to-cart button found');
+      const result = await testVariant(product, variant);
+
+      if (result.ok) {
+        console.log(`OK: ${label}`);
       } else {
-        const disabled = await button.isDisabled();
-
-        if (disabled) {
-          console.log('Product NOT available');
-        } else {
-          await button.click();
-          console.log('Product OK');
-        }
+        failures.push(`${label}: ${result.message}`);
+        console.log(`FAIL: ${label}: ${result.message}`);
       }
     }
   }
 
-  await browser.close();
+  if (failures.length > 0) {
+    console.log('\nFailures:');
+    for (const failure of failures) {
+      console.log(`- ${failure}`);
+    }
+
+    process.exit(1);
+  }
+
+  console.log('\nAll variants are addable to cart.');
 })();
