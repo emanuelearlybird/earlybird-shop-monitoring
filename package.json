@@ -1,0 +1,12 @@
+{
+  "name": "earlybird-shop-monitoring",
+  "version": "1.0.0",
+  "description": "Shop monitoring",
+  "main": "test.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.42.0"
+  }
+}
