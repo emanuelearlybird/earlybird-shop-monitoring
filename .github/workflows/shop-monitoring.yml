@@ -140,20 +140,6 @@ jobs:
               labels: ['shop-monitoring', 'automated']
             });
 
-      - name: Notify Microsoft Teams (only if webhook configured and failure changed)
-        if: steps.shoptest.outcome == 'failure' && steps.notify_issue.outputs.changed == 'true'
-        env:
-          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-          GH_SERVER_URL: ${{ github.server_url }}
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_RUN_ID: ${{ github.run_id }}
-        run: |
-          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
-            echo "TEAMS_WEBHOOK_URL secret not set – skipping Teams notification."
-            exit 0
-          fi
-          node .github/scripts/notify-teams.js
-
-      - name: Re-fail job if shop test failed
+            - name: Re-fail job if shop test failed
         if: steps.shoptest.outcome == 'failure'
         run: exit 1
